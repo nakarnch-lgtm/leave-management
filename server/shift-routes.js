@@ -1,8 +1,7 @@
 const express = require('express');
-const Database = require('better-sqlite3');
+const db = require('./db');
 
 const router = express.Router();
-const db = new Database('leave_management.db');
 
 // Initialize shift table
 db.exec(`

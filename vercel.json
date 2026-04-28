@@ -1,0 +1,14 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "env": {
+    "TURSO_CONNECTION_URL": "@turso_connection_url",
+    "TURSO_AUTH_TOKEN": "@turso_auth_token"
+  },
+  "functions": {
+    "server/index.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}

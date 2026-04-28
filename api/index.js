@@ -1,11 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const db = require('./db');
-const path = require('path');
-const shiftRoutes = require('./shift-routes');
+const db = require('../server/db');
 
 const app = express();
-const PORT = process.env.PORT || 3001;
 
 // Middleware
 app.use(cors());
@@ -35,6 +32,20 @@ db.exec(`
     approved_at TEXT,
     FOREIGN KEY (employee_id) REFERENCES employees(id)
   );
+
+  CREATE TABLE IF NOT EXISTS shifts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    shift_code TEXT,
+    note TEXT,
+    created_by TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_by TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(employee_id, date),
+    FOREIGN KEY (employee_id) REFERENCES employees(id)
+  );
 `);
 
 // Insert initial employee data
@@ -62,11 +73,6 @@ const employees = [
 
 employees.forEach(emp => insertEmployee.run(...emp));
 
-// Shift routes
-app.use('/api/shifts', shiftRoutes);
-
-// API Routes
-
 // Get all employees
 app.get('/api/employees', (req, res) => {
   const employees = db.prepare(`
@@ -87,7 +93,7 @@ app.get('/api/employees', (req, res) => {
   res.json(employees);
 });
 
-// Login endpoint - validate password
+// Login endpoint
 app.post('/api/login', (req, res) => {
   const { id, password } = req.body;
   
@@ -101,12 +107,10 @@ app.post('/api/login', (req, res) => {
     return res.status(401).json({ error: 'ไม่พบพนักงาน' });
   }
   
-  // Verify password (last 5 digits of ID card)
   if (password !== employee.password) {
     return res.status(401).json({ error: 'รหัสผ่านไม่ถูกต้อง' });
   }
   
-  // Return employee data on successful login
   res.json({
     id: employee.id,
     name: employee.name,
@@ -134,7 +138,6 @@ app.post('/api/employees', (req, res) => {
     return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
   }
   
-  // Check if employee already exists
   const existing = db.prepare('SELECT * FROM employees WHERE id = ?').get(id);
   if (existing) {
     return res.status(400).json({ error: 'รหัสพนักงานนี้มีอยู่แล้ว' });
@@ -175,7 +178,6 @@ app.patch('/api/employees/:id', (req, res) => {
 app.delete('/api/employees/:id', (req, res) => {
   const { id } = req.params;
   
-  // Prevent deleting BSM and ABSM
   const employee = db.prepare('SELECT * FROM employees WHERE id = ?').get(id);
   if (employee && ['manager', 'absm'].includes(employee.role)) {
     return res.status(403).json({ error: 'ไม่สามารถลบ BSM หรือ ABSM ได้' });
@@ -218,70 +220,12 @@ app.get('/api/leave-requests', (req, res) => {
   res.json(requests);
 });
 
-// Check leave conflicts for a date range
-app.post('/api/leave-requests/check-conflicts', (req, res) => {
-  const { start_date, end_date, exclude_id } = req.body;
-  
-  const conflicts = [];
-  const startDate = new Date(start_date);
-  const endDate = new Date(end_date);
-  
-  for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-    const dateStr = d.toISOString().split('T')[0];
-    const dayQuery = `
-      SELECT COUNT(*) as count
-      FROM leave_requests
-      WHERE status = 'approved'
-      AND ? BETWEEN start_date AND end_date
-      ${exclude_id ? 'AND id != ?' : ''}
-    `;
-    const dayParams = exclude_id ? [dateStr, exclude_id] : [dateStr];
-    const result = db.prepare(dayQuery).get(...dayParams);
-    
-    if (result.count >= 3) {
-      conflicts.push({
-        date: dateStr,
-        count: result.count
-      });
-    }
-  }
-  
-  res.json({
-    hasConflict: conflicts.length > 0,
-    conflicts
-  });
-});
-
 // Create leave request
 app.post('/api/leave-requests', (req, res) => {
   const { employee_id, leave_type, start_date, end_date, reason } = req.body;
   
   if (!employee_id || !leave_type || !start_date || !end_date) {
     return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
-  }
-  
-  const conflicts = [];
-  const startDate = new Date(start_date);
-  const endDate = new Date(end_date);
-  
-  for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-    const dateStr = d.toISOString().split('T')[0];
-    const result = db.prepare(`
-      SELECT COUNT(*) as count
-      FROM leave_requests
-      WHERE status = 'approved'
-      AND ? BETWEEN start_date AND end_date
-    `).get(dateStr);
-    
-    if (result.count >= 3) {
-      conflicts.push(dateStr);
-    }
-  }
-  
-  if (conflicts.length > 0) {
-    return res.status(400).json({ 
-      error: 'มีพนักงานลาเกิน 3 คนในวันที่: ' + conflicts.join(', ')
-    });
   }
   
   try {
@@ -303,7 +247,7 @@ app.post('/api/leave-requests', (req, res) => {
   }
 });
 
-// Update leave request status (approve/reject)
+// Update leave request status
 app.patch('/api/leave-requests/:id', (req, res) => {
   const { status, approved_by } = req.body;
   const { id } = req.params;
@@ -315,34 +259,6 @@ app.patch('/api/leave-requests/:id', (req, res) => {
   const approver = db.prepare('SELECT role FROM employees WHERE id = ?').get(approved_by);
   if (!approver || !['manager', 'absm'].includes(approver.role)) {
     return res.status(403).json({ error: 'คุณไม่มีสิทธิ์อนุมัติ' });
-  }
-  
-  if (status === 'approved') {
-    const request = db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id);
-    const conflicts = [];
-    const startDate = new Date(request.start_date);
-    const endDate = new Date(request.end_date);
-    
-    for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-      const dateStr = d.toISOString().split('T')[0];
-      const result = db.prepare(`
-        SELECT COUNT(*) as count
-        FROM leave_requests
-        WHERE status = 'approved'
-        AND ? BETWEEN start_date AND end_date
-        AND id != ?
-      `).get(dateStr, id);
-      
-      if (result.count >= 3) {
-        conflicts.push(dateStr);
-      }
-    }
-    
-    if (conflicts.length > 0) {
-      return res.status(400).json({ 
-        error: 'มีพนักงานลาเกิน 3 คนในวันที่: ' + conflicts.join(', ')
-      });
-    }
   }
   
   try {
@@ -377,7 +293,50 @@ app.delete('/api/leave-requests/:id', (req, res) => {
   }
 });
 
-// Get leave statistics
+// Get shifts
+app.get('/api/shifts/range', (req, res) => {
+  const { start_date, end_date } = req.query;
+  
+  const shifts = db.prepare(`
+    SELECT * FROM shifts 
+    WHERE date BETWEEN ? AND ?
+    ORDER BY date, employee_id
+  `).all(start_date, end_date);
+  
+  res.json(shifts);
+});
+
+// Create/Update shift
+app.post('/api/shifts', (req, res) => {
+  const { employee_id, date, shift_code, note, created_by } = req.body;
+  
+  if (!employee_id || !date) {
+    return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
+  }
+  
+  try {
+    db.prepare(`
+      INSERT INTO shifts (employee_id, date, shift_code, note, created_by)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(employee_id, date) DO UPDATE SET
+        shift_code = excluded.shift_code,
+        note = excluded.note,
+        updated_by = excluded.created_by,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(employee_id, date, shift_code, note, created_by);
+    
+    const shift = db.prepare(`
+      SELECT * FROM shifts 
+      WHERE employee_id = ? AND date = ?
+    `).get(employee_id, date);
+    
+    res.json(shift);
+  } catch (error) {
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล' });
+  }
+});
+
+// Get statistics
 app.get('/api/statistics', (req, res) => {
   const stats = {
     pending: db.prepare('SELECT COUNT(*) as count FROM leave_requests WHERE status = "pending"').get().count,
@@ -389,6 +348,4 @@ app.get('/api/statistics', (req, res) => {
   res.json(stats);
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
+module.exports = app;
